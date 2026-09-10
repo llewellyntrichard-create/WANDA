@@ -1,6 +1,8 @@
 fastapi
 uvicorn
+requests
 httpx
 pytz
+apscheduler
 google-genai
 python-dotenv
