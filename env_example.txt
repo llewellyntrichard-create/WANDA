@@ -1,0 +1,29 @@
+# =====================================================================
+# PROJECT WANDA 2 - RAILWAY PRODUCTION ENVIRONMENT CONFIGURATION
+# =====================================================================
+
+# Server Networking
+PORT=8000
+ENVIRONMENT=production
+
+# Database Storage Path (Mapped to Railway Persistent Volume)
+MONOLOG_DB_FILE=/app/data/wanda2.db
+
+# Google Gemini API Credentials
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# Meta WhatsApp Cloud API Credentials
+META_APP_SECRET=your_meta_app_secret_here
+VERIFY_TOKEN=your_meta_webhook_verify_token_here
+PHONE_NUMBER_ID=your_default_whatsapp_phone_number_id_here
+WHATSAPP_TOKEN=your_default_whatsapp_access_token_here
+
+# Yoco Payment Gateway Credentials (Platform Master Keys)
+YOCO_SECRET_KEY=sk_live_your_yoco_secret_key_here
+YOCO_WEBHOOK_SECRET=secret_your_yoco_webhook_secret_here
+
+# Optional Litestream S3 Disaster Recovery Replication
+LITESTREAM_REPLICA_BUCKET=your_s3_or_r2_bucket_name
+LITESTREAM_ACCESS_KEY_ID=your_s3_access_key
+LITESTREAM_SECRET_ACCESS_KEY=your_s3_secret_key
+LITESTREAM_ENDPOINT=https://your-s3-endpoint.com
