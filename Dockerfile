@@ -25,7 +25,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN mkdir -p /app/data
 
 # Copy application files and entrypoint script
-COPY wanda2-v2.py /app/
+COPY WANDA.py /app/
 COPY entrypoint.sh /app/
 RUN chmod +x /app/entrypoint.sh
 

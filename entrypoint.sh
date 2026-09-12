@@ -22,4 +22,4 @@ fi
 PORT="${PORT:-8000}"
 
 echo "[Uvicorn] Starting FastAPI application server on 0.0.0.0:${PORT}..."
-exec uvicorn wanda2-v2:app --host 0.0.0.0 --port "$PORT"
+exec uvicorn WANDA:app --host 0.0.0.0 --port "$PORT"
