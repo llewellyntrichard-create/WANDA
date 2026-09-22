@@ -1475,14 +1475,10 @@ def run_owner_agent(
         """Retrieves company description, contact email, and core business overview."""
         info = fetch_business_profile(business_id)
         return (
-            f"Business: {info.get('business_name')}
-"
-            f"Core Business: {info.get('core_business')}
-"
-            f"Website: {info.get('website')}
-"
-            f"Email: {info.get('primary_e_mail')}
-"
+            f"Business: {info.get('business_name')}\n"
+            f"Overview: {info.get('core_business')}\n"
+            f"Website: {info.get('website')}\n"
+            f"Email: {info.get('primary_e_mail')}\n"
             f"Phone: {info.get('primary_mail')}"
         )
 
@@ -1494,15 +1490,11 @@ def run_owner_agent(
         output = []
         for it in items:
             output.append(
-                f"- ID: {it['product_id']} | {it['product_name']} ({it['product_type']})
-"
-                f"  Price: R{it['cost']} {it['unit_measure']} | Lead Time: {it['lead_times']}
-"
+                f"- ID: {it['product_id']} | {it['product_name']} ({it['product_type']})\n"
+                f"  Price: R{it['cost']} {it['unit_measure']} | Lead Time: {it['lead_times']}\n"
                 f"  Warranty/Return: {it['policy'] or 'Standard terms apply'}"
             )
-        return "
-
-".join(output)
+        return "\n\n".join(output)
 
     def add_reminder(detail: str) -> str:
         """Logs a new to-do task for the owner."""
@@ -1658,8 +1650,9 @@ def run_owner_agent(
         return query_site_history_by_location(business_id=business_id, address_query=address, lat=lat, lon=lon)
 
     system_instruction = (
-        f"You are the executive assistant to the owner of {business_name}.\n"
+        f"You are the executive assistant to the owner of {business_name} ({core_business}).\n"
         "CAPABILITIES:\n"
+        "- Inspect company profile & catalog (`get_business_overview`, `get_products_or_services`).\n"
         "- Manage to-dos (`add_reminder`, `list_reminders`).\n"
         "- Inspect appointments (`list_schedule_appointments`).\n"
         "- Update appointment status & log work notes (`update_appointment_status`).\n"
