@@ -730,9 +730,11 @@ def search_catalog(business_id: str, query: str = "") -> List[Dict[str, Any]]:
             WHERE p.business_id = ?
         """
         params: List[Any] = [business_id]
-        if query:
+        clean_q = query.strip().lower() if query else ""
+        generic_terms = ["all", "products", "services", "catalog", "available", "list", "what", "anything", "items", "options", "price", "prices"]
+        if clean_q and clean_q not in generic_terms:
             sql += " AND (p.product_name LIKE ? OR p.product_type LIKE ? OR p.core_business LIKE ?)"
-            wildcard = f"%{query}%"
+            wildcard = f"%{clean_q}%"
             params.extend([wildcard, wildcard, wildcard])
 
         cursor.execute(sql, tuple(params))
@@ -1233,7 +1235,7 @@ def run_customer_agent(
         return f"Address: {addr}\nCoverage: {srv.get('service_suburb')}, {srv.get('service_city')}\nCall-out: {srv.get('delivery_cost')}"
 
     def get_products_or_services(search_term: str = "") -> str:
-        """Looks up catalog items, prices, lead times, and warranty policies."""
+        """Looks up catalog items, prices, lead times, and warranty policies. Pass empty string '' or 'all' to retrieve all catalog items."""
         items = search_catalog(business_id, query=search_term)
         if not items:
             return "No matching products or services found."
@@ -1392,12 +1394,13 @@ def run_customer_agent(
     system_instruction = (
         f"You are the official WhatsApp assistant for {business_name}.\n"
         "STRICT COMPLIANCE RULES:\n"
-        "1. ONLY state facts returned by your tools. Never guess prices, slots, or hours.\n"
-        "2. If requested details are absent, invoke `escalate_unanswered_query_to_owner`.\n"
-        "3. Customers can book appointments using `book_customer_appointment` or check status via `get_customer_appointment_status`.\n"
-        "4. Inquire about public events, expos, and trade shows using `get_public_events`.\n"
-        "5. Generate Yoco invoices using `request_invoice_quote`.\n"
-        "6. ALWAYS reply in polite, concise WhatsApp-formatted text."
+        "1. ALWAYS invoke `get_products_or_services` to look up available products, services, prices, warranties, and catalog items.\n"
+        "2. ONLY state facts returned by your tools. Never guess prices, slots, or hours.\n"
+        "3. If requested details are absent after invoking tools, invoke `escalate_unanswered_query_to_owner`.\n"
+        "4. Customers can book appointments using `book_customer_appointment` or check status via `get_customer_appointment_status`.\n"
+        "5. Inquire about public events, expos, and trade shows using `get_public_events`.\n"
+        "6. Generate Yoco invoices using `request_invoice_quote`.\n"
+        "7. ALWAYS reply in polite, concise WhatsApp-formatted text."
     )
 
     contents_payload: List[Any] = []
@@ -1466,6 +1469,40 @@ def run_owner_agent(
 ) -> str:
     business_data = fetch_business_profile(business_id)
     business_name = business_data.get("business_name", "your business")
+    core_business = business_data.get("core_business", "Services")
+
+    def get_business_overview() -> str:
+        """Retrieves company description, contact email, and core business overview."""
+        info = fetch_business_profile(business_id)
+        return (
+            f"Business: {info.get('business_name')}
+"
+            f"Core Business: {info.get('core_business')}
+"
+            f"Website: {info.get('website')}
+"
+            f"Email: {info.get('primary_e_mail')}
+"
+            f"Phone: {info.get('primary_mail')}"
+        )
+
+    def get_products_or_services(search_term: str = "") -> str:
+        """Looks up catalog items, prices, lead times, and warranty policies."""
+        items = search_catalog(business_id, query=search_term)
+        if not items:
+            return "No matching products or services found."
+        output = []
+        for it in items:
+            output.append(
+                f"- ID: {it['product_id']} | {it['product_name']} ({it['product_type']})
+"
+                f"  Price: R{it['cost']} {it['unit_measure']} | Lead Time: {it['lead_times']}
+"
+                f"  Warranty/Return: {it['policy'] or 'Standard terms apply'}"
+            )
+        return "
+
+".join(output)
 
     def add_reminder(detail: str) -> str:
         """Logs a new to-do task for the owner."""
@@ -1662,6 +1699,8 @@ def run_owner_agent(
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     tools=[
+                        get_business_overview,
+                        get_products_or_services,
                         add_reminder,
                         list_reminders,
                         list_schedule_appointments,
