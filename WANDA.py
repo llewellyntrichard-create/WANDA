@@ -378,7 +378,7 @@ def seed_test_data() -> None:
 
         cursor.execute("""
             INSERT INTO business_whatsapp (business_id, w_number, phone_number_id, access_token)
-            VALUES (?, ?, '1348277451695205', 'EAAG_TEST_PERMANENT_TOKEN_12345')
+            VALUES (?, ?, COALESCE(NULLIF(PHONE_NUMBER_ID, ''), '1348277451695205'), COALESCE(NULLIF(WHATSAPP_TOKEN, ''), 'EAAG_TEST_PERMANENT_TOKEN_12345'))
         """, (BIZ_ID, WA_BUSINESS_NUM))
 
         cursor.execute("""
@@ -564,19 +564,26 @@ def fetch_recent_chat_history(business_id: str, sender_phone: str, limit: int = 
 
 def resolve_business_id_from_destination(destination_number: str) -> Optional[str]:
     """Resolves business tenant using the incoming WhatsApp business line."""
+    if not destination_number:
+        return "tenant_apex_plumbing"
     clean_number = normalize_phone(destination_number)
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
             SELECT business_id FROM business_whatsapp
-            WHERE w_number = ? OR w_number LIKE ?
+            WHERE w_number = ? OR w_number LIKE ? OR ? LIKE '%' || w_number
             LIMIT 1
             """,
-            (clean_number, f"%{clean_number}"),
+            (clean_number, f"%{clean_number}", clean_number),
         )
         row = cursor.fetchone()
-        return row["business_id"] if row else None
+        if row and row["business_id"]:
+            return row["business_id"]
+        # Fallback to default seeded tenant
+        cursor.execute("SELECT business_id FROM business_info LIMIT 1")
+        default_row = cursor.fetchone()
+        return default_row["business_id"] if default_row else "tenant_apex_plumbing" 
 
 def get_tenant_whatsapp_credentials(business_id: str) -> Tuple[str, str]:
     """Retrieves tenant-specific WhatsApp credentials or falls back to environment defaults."""
@@ -588,7 +595,14 @@ def get_tenant_whatsapp_credentials(business_id: str) -> Tuple[str, str]:
         )
         row = cursor.fetchone()
         if row and row["phone_number_id"] and row["access_token"]:
-            return row["phone_number_id"], row["access_token"]
+            pid = row["phone_number_id"]
+            tok = row["access_token"]
+            # Fallback if DB contains dummy placeholder values
+            if tok.startswith("EAAG_TEST_") or not tok:
+                tok = WHATSAPP_TOKEN
+            if pid == "1348277451695205" or not pid:
+                pid = PHONE_NUMBER_ID
+            return pid or PHONE_NUMBER_ID, tok or WHATSAPP_TOKEN
         return PHONE_NUMBER_ID, WHATSAPP_TOKEN
 
 def get_tenant_yoco_credentials(business_id: str) -> Dict[str, str]:
