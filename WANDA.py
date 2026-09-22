@@ -376,10 +376,13 @@ def seed_test_data() -> None:
             VALUES (?, ?, ?, 'info@apexplumbing.co.za', 'https://www.apexplumbing.co.za', 'Emergency Residential & Commercial Plumbing Services')
         """, (BIZ_ID, BIZ_NAME, OWNER_PHONE_NUM))
 
+        wa_phone_id = PHONE_NUMBER_ID.strip() if PHONE_NUMBER_ID else '1348277451695205'
+        wa_access_token = WHATSAPP_TOKEN.strip() if WHATSAPP_TOKEN else 'EAAG_TEST_PERMANENT_TOKEN_12345'
+
         cursor.execute("""
             INSERT INTO business_whatsapp (business_id, w_number, phone_number_id, access_token)
-            VALUES (?, ?, COALESCE(NULLIF(PHONE_NUMBER_ID, ''), '1348277451695205'), COALESCE(NULLIF(WHATSAPP_TOKEN, ''), 'EAAG_TEST_PERMANENT_TOKEN_12345'))
-        """, (BIZ_ID, WA_BUSINESS_NUM))
+            VALUES (?, ?, ?, ?)
+        """, (BIZ_ID, WA_BUSINESS_NUM, wa_phone_id, wa_access_token))
 
         cursor.execute("""
             INSERT INTO business_yoco (business_id, yoco_secret_key, yoco_public_key)
