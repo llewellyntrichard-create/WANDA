@@ -26,12 +26,11 @@ except ImportError:
     types = None
 
 from dotenv import load_dotenv
-
 load_dotenv()
 
-# =====================================================================
-# CONFIGURATION & INITIALIZATION
-# =====================================================================
+### =====================================================================
+### CONFIGURATION & INITIALIZATION
+### =====================================================================
 DB_FILE = os.getenv("MONOLOG_DB_FILE", "monolog.db")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
@@ -50,9 +49,9 @@ logger = logging.getLogger("wanda2")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if (genai and GEMINI_API_KEY) else None
 
-# =====================================================================
-# 1. DATABASE SCHEMA & ACCESS LAYER (WANDA 2 EXPANDED)
-# =====================================================================
+### =====================================================================
+### 1. DATABASE SCHEMA & ACCESS LAYER
+### =====================================================================
 def get_db_connection() -> sqlite3.Connection:
     """Creates a database connection with dict row access, foreign keys, and write timeout."""
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
@@ -93,7 +92,6 @@ def init_db() -> None:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (business_id) REFERENCES business_info(business_id)
             );
-
 
             CREATE TABLE IF NOT EXISTS product_info_detail (
                 product_id TEXT PRIMARY KEY,
@@ -278,7 +276,7 @@ def init_db() -> None:
             );
 
             -- =========================================================
-            -- WANDA 2 NEW ENTERPRISE & BILLING TABLES
+            -- ENTERPRISE, USAGE & BILLING TABLES
             -- =========================================================
             
             -- Token & Message Usage Tracking
@@ -341,6 +339,142 @@ def init_db() -> None:
         """)
         conn.commit()
 
+def seed_test_data() -> None:
+    """Wipes existing table rows and seeds fresh test data on application startup."""
+    with get_db_connection() as conn:
+        conn.execute("PRAGMA foreign_keys = OFF;")
+        cursor = conn.cursor()
+
+        tables = [
+            "business_info", "business_whatsapp", "business_yoco", "product_info_detail",
+            "return_policy", "operating_hours", "business_location", "human_escalation",
+            "service_area", "client_table", "reminder_table", "business_events",
+            "customer_appointments", "open_queries", "query_items", "chat_history",
+            "conversation_audit_log", "system_event_log", "tenant_token_usage",
+            "tenant_quotas", "tenant_subscriptions", "invoices", "invoice_items"
+        ]
+
+        logger.info("Wiping existing database tables on startup...")
+        for t in tables:
+            try:
+                cursor.execute(f"DELETE FROM {t};")
+            except Exception as e:
+                logger.warning(f"Note on table {t}: {e}")
+
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON;")
+
+        logger.info("Seeding fresh test data...")
+        BIZ_ID = "tenant_apex_plumbing"
+        BIZ_NAME = "Apex Plumbing Services"
+        WA_BUSINESS_NUM = "27788109754"   # WhatsApp Line: 0788109754
+        OWNER_PHONE_NUM = "27716850167"   # Owner Phone:   0716850167
+
+        # 1. Tenant Business Profile & Numbers
+        cursor.execute("""
+            INSERT INTO business_info (business_id, business_name, primary_mail, primary_e_mail, website, core_business)
+            VALUES (?, ?, ?, 'info@apexplumbing.co.za', 'https://www.apexplumbing.co.za', 'Emergency Residential & Commercial Plumbing Services')
+        """, (BIZ_ID, BIZ_NAME, OWNER_PHONE_NUM))
+
+        cursor.execute("""
+            INSERT INTO business_whatsapp (business_id, w_number, phone_number_id, access_token)
+            VALUES (?, ?, '1348277451695205', 'EAAG_TEST_PERMANENT_TOKEN_12345')
+        """, (BIZ_ID, WA_BUSINESS_NUM))
+
+        cursor.execute("""
+            INSERT INTO business_yoco (business_id, yoco_secret_key, yoco_public_key)
+            VALUES (?, 'sk_test_tenant_secret_key_12345', 'pk_test_tenant_public_key_12345')
+        """, (BIZ_ID,))
+
+        cursor.execute("""
+            INSERT INTO human_escalation (business_id, man_number, response_time, takeover_active)
+            VALUES (?, ?, 'within 1 hour', 0)
+        """, (BIZ_ID, OWNER_PHONE_NUM))
+
+        cursor.execute("""
+            INSERT INTO operating_hours (business_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, public_holiday)
+            VALUES (?, '08:00-17:00', '08:00-17:00', '08:00-17:00', '08:00-17:00', '08:00-17:00', '09:00-13:00', 'Closed', 'Emergency Only')
+        """, (BIZ_ID,))
+
+        cursor.execute("""
+            INSERT INTO business_location (business_id, building, building_number, street, suburb, city, province)
+            VALUES (?, 'Unit 4', '12', 'Main Road', 'Sandton', 'Johannesburg', 'Gauteng')
+        """, (BIZ_ID,))
+
+        cursor.execute("""
+            INSERT INTO service_area (business_id, service_province, service_city, service_suburb, delivery_cost)
+            VALUES (?, 'Gauteng', 'Johannesburg', 'Sandton, Rosebank, Bryanston, Randburg, Fourways', 'R450.00 Call-out Fee')
+        """, (BIZ_ID,))
+
+        cursor.execute("""
+            INSERT INTO tenant_subscriptions (tenant_id, plan_name, subscription_status)
+            VALUES (?, 'STARTER', 'ACTIVE')
+        """, (BIZ_ID,))
+
+        cursor.execute("""
+            INSERT INTO tenant_quotas (tenant_id, monthly_token_quota, daily_token_quota, monthly_message_quota, daily_message_quota)
+            VALUES (?, 500000, 50000, 2000, 300)
+        """, (BIZ_ID,))
+
+        # 2. Product Catalog with Prices for Gemini AI
+        products = [
+            ("prod_callout", "Standard Call-Out & Inspection", "Service", "per visit", 450.0, "Residential Plumbing", "Same Day", "Non-refundable diagnostic fee."),
+            ("prod_geyser", "Geyser Pressure Valve Replacement", "Service + Part", "per job", 1850.0, "Geyser Maintenance", "Same Day", "12-Month parts & labor warranty."),
+            ("prod_drain", "Unblock Main Sewer Drain", "Service", "per job", 1200.0, "Drainage", "Same Day", "6-Month clearance guarantee."),
+            ("prod_pipe", "Burst Pipe Emergency Repair", "Service + Part", "per job", 950.0, "Emergency Repairs", "Same Day", "6-Month workmanship warranty."),
+            ("prod_tap", "Tap & Mixer Fitting Replacement", "Service", "per unit", 650.0, "General Plumbing", "1-2 Days", "Client supplies mixer or hardware.")
+        ]
+
+        for pid, name, ptype, unit, cost, core, lead, policy in products:
+            cursor.execute("""
+                INSERT INTO product_info_detail (product_id, business_id, product_name, product_type, unit_measure, cost, core_business, lead_times)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (pid, BIZ_ID, name, ptype, unit, cost, core, lead))
+
+            cursor.execute("""
+                INSERT INTO return_policy (product_id, has_return_policy, policy)
+                VALUES (?, 1, ?)
+            """, (pid, policy))
+
+        # 3. Events, Clients & Appointments
+        cursor.execute("""
+            INSERT INTO business_events (event_id, business_id, event_name, start_date, venue_address, ticket_fee, description, owner_attending)
+            VALUES ('evt_expo', ?, 'Sandton Trade & Home Expo', '2026-10-15', 'Sandton Convention Centre', 0.0, 'Free plumbing diagnostics & water saving consultation.', 1)
+        """, (BIZ_ID,))
+
+        cursor.execute("""
+            INSERT INTO client_table (customer_id, business_id, name, surname, mobile_number, email, address, latitude, longitude, first_contact_source)
+            VALUES ('cust_john', ?, 'John', 'Smith', '27821112222', 'john@example.com', '14 Rosebank Road, Sandton', -26.1075, 28.0567, 'WHATSAPP_INBOUND')
+        """, (BIZ_ID,))
+
+        cursor.execute("""
+            INSERT INTO client_table (customer_id, business_id, name, surname, mobile_number, email, address, latitude, longitude, first_contact_source)
+            VALUES ('cust_sarah', ?, 'Sarah', 'Connor', '27833334444', 'sarah@example.com', '22 Bryanston Drive, Bryanston', -26.0560, 28.0240, 'WHATSAPP_INBOUND')
+        """, (BIZ_ID,))
+
+        cursor.execute("""
+            INSERT INTO customer_appointments (appointment_id, business_id, customer_id, subject, appointment_date, start_time, end_time, location, latitude, longitude, status, notes, csat_score, csat_feedback)
+            VALUES ('apt_completed_101', ?, 'cust_john', 'Geyser Pressure Valve Replacement', '2026-08-10', '10:00', '11:00', '14 Rosebank Road, Sandton', -26.1075, 28.0567, 'COMPLETED', 'Replaced 400kPa pressure valve. Gate access code: 1234.', 5, 'Excellent service and punctual!')
+        """, (BIZ_ID,))
+
+        cursor.execute("""
+            INSERT INTO customer_appointments (appointment_id, business_id, customer_id, subject, appointment_date, start_time, end_time, location, status)
+            VALUES ('apt_future_102', ?, 'cust_sarah', 'Burst Pipe Leak Inspection', '2026-09-25', '14:00', '15:00', '22 Bryanston Drive, Bryanston', 'CONFIRMED')
+        """, (BIZ_ID,))
+
+        cursor.execute("""
+            INSERT INTO reminder_table (reminder_id, business_id, detail)
+            VALUES ('rem_001', ?, 'Buy six 15mm copper fittings and Teflon tape')
+        """, (BIZ_ID,))
+
+        cursor.execute("""
+            INSERT INTO reminder_table (reminder_id, business_id, detail)
+            VALUES ('rem_002', ?, 'Follow up on John Smith geyser valve guarantee inspection')
+        """, (BIZ_ID,))
+
+        conn.commit()
+        logger.info("✓ Database wipe & fresh test data seed completed successfully.")
+
 def generate_custom_id(prefix: str) -> str:
     """Generates a collision-resistant UUID4 prefixed identifier."""
     return f"{prefix}_{uuid.uuid4().hex}"
@@ -380,7 +514,9 @@ def log_system_event(
     business_id: Optional[str] = None,
     context: Optional[str] = None
 ) -> None:
-    """Logs system events, errors, tool calls, and diagnostics."""
+    """Logs system events, errors, tool calls, and diagnostics to SQLite and stdout."""
+    # Emit to console for Railway Deploy Logs streaming
+    print(f"[{severity}] [{component}] {message}" + (f" (Tenant: {business_id})" if business_id else ""), flush=True)
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -453,11 +589,10 @@ def get_tenant_whatsapp_credentials(business_id: str) -> Tuple[str, str]:
         row = cursor.fetchone()
         if row and row["phone_number_id"] and row["access_token"]:
             return row["phone_number_id"], row["access_token"]
-    return PHONE_NUMBER_ID, WHATSAPP_TOKEN
-
+        return PHONE_NUMBER_ID, WHATSAPP_TOKEN
 
 def get_tenant_yoco_credentials(business_id: str) -> Dict[str, str]:
-    """Retrieves tenant-specific Yoco API credentials for direct merchant payouts, falling back to global platform credentials if unconfigured."""
+    """Retrieves tenant-specific Yoco API credentials for direct merchant payouts."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -470,10 +605,10 @@ def get_tenant_yoco_credentials(business_id: str) -> Dict[str, str]:
                 "yoco_secret_key": row["yoco_secret_key"],
                 "yoco_public_key": row["yoco_public_key"] or ""
             }
-    return {
-        "yoco_secret_key": YOCO_SECRET_KEY,
-        "yoco_public_key": ""
-    }
+        return {
+            "yoco_secret_key": YOCO_SECRET_KEY,
+            "yoco_public_key": ""
+        }
 
 def is_owner_phone(business_id: str, sender_phone: str) -> bool:
     """Validates if sender matches the authorized manager number via normalized comparison."""
@@ -652,9 +787,9 @@ def create_order_lead_query(business_id: str, customer_id: str, items: List[Dict
         conn.commit()
         return query_id
 
-# =====================================================================
-# 2. TOKEN LIMITER & SUBSCRIPTION MANAGEMENT
-# =====================================================================
+### =====================================================================
+### 2. TOKEN LIMITER & SUBSCRIPTION MANAGEMENT
+### =====================================================================
 def check_tenant_quota(business_id: str) -> Tuple[bool, str]:
     """Validates subscription status and checks daily/monthly token and message quotas."""
     with get_db_connection() as conn:
@@ -712,9 +847,9 @@ def record_token_usage(
     except Exception as e:
         logger.error(f"Failed to record token usage: {e}")
 
-# =====================================================================
-# 3. YOCO BILLING & INVOICING ENGINE
-# =====================================================================
+### =====================================================================
+### 3. YOCO BILLING & INVOICING ENGINE
+### =====================================================================
 def create_yoco_checkout_link(
     business_id: str,
     amount_zar: float,
@@ -745,7 +880,6 @@ def create_customer_invoice(
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        # Verify customer_id exists or persist placeholder
         cursor.execute("SELECT customer_id FROM client_table WHERE customer_id = ?", (customer_id,))
         if not cursor.fetchone():
             cursor.execute(
@@ -779,9 +913,9 @@ def create_customer_invoice(
 
     return inv_id, chk_url
 
-# =====================================================================
-# 4. WHATSAPP OUTBOUND (NATIVE ASYNC HTTPX) & MEDIA RETRIEVAL
-# =====================================================================
+### =====================================================================
+### 4. WHATSAPP OUTBOUND (NATIVE ASYNC HTTPX) & MEDIA RETRIEVAL
+### =====================================================================
 async def send_whatsapp_message_async(
     recipient_phone: str,
     message_text: str,
@@ -790,7 +924,7 @@ async def send_whatsapp_message_async(
     """Dispatches outbound text messages asynchronously via Meta Graph API using httpx."""
     clean_recipient = normalize_phone(recipient_phone)
     phone_id, access_token = get_tenant_whatsapp_credentials(business_id) if business_id else (PHONE_NUMBER_ID, WHATSAPP_TOKEN)
-
+    
     url = f"https://graph.facebook.com/{META_API_VERSION}/{phone_id}/messages"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -803,22 +937,21 @@ async def send_whatsapp_message_async(
         "text": {"body": message_text},
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            res = await client.post(url, json=data, headers=headers)
+        async with httpx.AsyncClient() as client:
+            res = await client.post(url, json=data, headers=headers, timeout=10.0)
             res.raise_for_status()
-        logger.info(f"Async Outbound WhatsApp dispatched to +{clean_recipient}")
-        if business_id:
-            log_conversation(business_id, clean_recipient, "OUTBOUND", "TEXT", message_text)
+            logger.info(f"Outbound WhatsApp dispatched to +{clean_recipient}")
+            if business_id:
+                log_conversation(business_id, clean_recipient, "OUTBOUND", "TEXT", message_text)
     except Exception as e:
-        err_msg = f"Failed async outbound WhatsApp to +{clean_recipient}: {e}"
+        err_msg = f"Failed outbound WhatsApp to +{clean_recipient}: {e}"
         logger.error(err_msg)
-        log_system_event("ERROR", "META_OUTBOUND_ASYNC", err_msg, business_id=business_id)
+        log_system_event("ERROR", "META_OUTBOUND", err_msg, business_id=business_id)
 
 def send_whatsapp_message(recipient_phone: str, message_text: str, business_id: Optional[str] = None) -> None:
-    """Synchronous compatibility wrapper for outbound WhatsApp messages."""
+    """Synchronous fallback dispatch wrapper."""
     clean_recipient = normalize_phone(recipient_phone)
     phone_id, access_token = get_tenant_whatsapp_credentials(business_id) if business_id else (PHONE_NUMBER_ID, WHATSAPP_TOKEN)
-
     url = f"https://graph.facebook.com/{META_API_VERSION}/{phone_id}/messages"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -854,9 +987,9 @@ async def download_meta_audio(media_id: str, business_id: Optional[str] = None) 
         audio_res.raise_for_status()
         return audio_res.content
 
-# =====================================================================
-# 5. ADVANCED SCHEDULING & REMINDER ENGINE
-# =====================================================================
+### =====================================================================
+### 5. ADVANCED SCHEDULING ENGINE (40-MIN BUFFERS & CONFLICT CHECKS)
+### =====================================================================
 def is_within_operating_hours(business_id: str, date_str: str, start_time_str: str, end_time_str: str) -> Tuple[bool, str]:
     """Validates that requested slot falls within the tenant's configured operating hours."""
     hours = fetch_operating_hours(business_id)
@@ -882,7 +1015,6 @@ def is_within_operating_hours(business_id: str, date_str: str, start_time_str: s
 
         if req_start < op_start or req_end > op_end:
             return False, f"Requested time is outside operating hours ({day_schedule.strip()})."
-
         return True, ""
     except Exception as e:
         log_system_event("WARN", "HOURS_CHECK", f"Could not parse hours: {e}", business_id=business_id)
@@ -931,9 +1063,43 @@ def check_appointment_conflict_with_buffer(
     except ValueError as e:
         return False, f"Invalid time/date formatting: {e}"
 
-# =====================================================================
-# 6. SITE CLIENT HISTORY & HAVERSINE SPATIAL LOOKUP
-# =====================================================================
+async def dispatch_customer_appointment_reminders() -> None:
+    """Background worker sending automated 24-hour advance WhatsApp reminders."""
+    tomorrow_str = (datetime.datetime.now(SAST_TIMEZONE) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    logger.info(f"Checking for 24h customer appointment reminders for {tomorrow_str}")
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT a.appointment_id, a.business_id, a.subject, a.start_time, a.location, c.name, c.mobile_number
+            FROM customer_appointments a
+            JOIN client_table c ON a.customer_id = c.customer_id
+            WHERE a.appointment_date = ?
+              AND a.status = 'CONFIRMED'
+              AND a.reminder_sent = 0
+            """,
+            (tomorrow_str,)
+        )
+        reminders = cursor.fetchall()
+
+        for r in reminders:
+            msg = (
+                f"🔔 *Friendly Reminder:* Hi {r['name']}, you have an upcoming service appointment tomorrow ({tomorrow_str}) "
+                f"at {r['start_time']} for '{r['subject']}' ({r['location'] or 'On site'}). "
+                f"Please let us know if you need to reschedule!"
+            )
+            await send_whatsapp_message_async(recipient_phone=r['mobile_number'], message_text=msg, business_id=r['business_id'])
+            
+            cursor.execute(
+                "UPDATE customer_appointments SET reminder_sent = 1 WHERE appointment_id = ?",
+                (r['appointment_id'],)
+            )
+        conn.commit()
+
+### =====================================================================
+### 6. SITE CLIENT HISTORY & HAVERSINE SPATIAL LOOKUP
+### =====================================================================
 def query_site_history_by_location(
     business_id: str,
     address_query: str = "",
@@ -1007,9 +1173,9 @@ def query_site_history_by_location(
 
         return "\n".join(history_lines)
 
-# =====================================================================
-# 7. AGENT EXECUTION RUNNERS (CUSTOMER & OWNER MODES)
-# =====================================================================
+### =====================================================================
+### 7. AGENT EXECUTION RUNNERS (CUSTOMER & OWNER MODES)
+### =====================================================================
 def run_customer_agent(
     business_id: str,
     customer_phone: str,
@@ -1507,9 +1673,9 @@ def run_owner_agent(
     save_chat_turn(business_id, owner_phone, "model", reply_text)
     return reply_text
 
-# =====================================================================
-# 8. INBOUND DISPATCH & EXPLICIT RELAY INTERCEPTION
-# =====================================================================
+### =====================================================================
+### 8. INBOUND DISPATCH & EXPLICIT RELAY INTERCEPTION
+### =====================================================================
 async def handle_owner_relay_message(business_id: str, text: str) -> Optional[str]:
     """Intercepts the explicit pattern 'Tell Client [Name]: [Message]' and dispatches outbound."""
     match = re.match(r"^tell\s+client\s+([a-zA-Z\s]+?)\s*:\s*(.+)$", text, re.IGNORECASE)
@@ -1632,9 +1798,9 @@ async def process_incoming_payload(
 
     await send_whatsapp_message_async(recipient_phone=sender_phone, message_text=reply_text, business_id=business_id)
 
-# =====================================================================
-# 9. AUTOMATED BACKGROUND SCHEDULERS (MORNING DIGEST & 24H REMINDERS)
-# =====================================================================
+### =====================================================================
+### 9. AUTOMATED BACKGROUND SCHEDULERS (MORNING DIGEST & 24H REMINDERS)
+### =====================================================================
 async def dispatch_daily_morning_digest() -> None:
     """Dispatches daily 09:00 AM SAST agenda summaries to business owners."""
     today_str = datetime.datetime.now(SAST_TIMEZONE).strftime("%Y-%m-%d")
@@ -1678,53 +1844,27 @@ async def dispatch_daily_morning_digest() -> None:
             msg = "\n".join(briefing)
             await send_whatsapp_message_async(recipient_phone=owner_phone, message_text=msg, business_id=business_id)
 
-async def dispatch_customer_appointment_reminders() -> None:
-    """Dispatches 24-hour pre-appointment reminders to customers via WhatsApp."""
-    tomorrow_str = (datetime.datetime.now(SAST_TIMEZONE) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-    logger.info(f"Checking for 24h customer appointment reminders for {tomorrow_str}")
-
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT a.appointment_id, a.business_id, a.subject, a.appointment_date, a.start_time, a.location, c.mobile_number, c.name
-            FROM customer_appointments a
-            JOIN client_table c ON a.customer_id = c.customer_id
-            WHERE a.appointment_date = ? AND a.status IN ('CONFIRMED', 'PENDING_CONFIRMATION') AND a.reminder_sent = 0
-            """,
-            (tomorrow_str,)
-        )
-        reminders = cursor.fetchall()
-        for r in reminders:
-            cust_name = r["name"] or "Customer"
-            msg = f"🔔 *Friendly Reminder:* Hi {cust_name}, you have an appointment tomorrow ({r['appointment_date']} at {r['start_time']}) for '{r['subject']}'. Location: {r['location'] or 'As agreed'}. Reply to this message if you need to reschedule."
-            await send_whatsapp_message_async(recipient_phone=r["mobile_number"], message_text=msg, business_id=r["business_id"])
-            
-            cursor.execute("UPDATE customer_appointments SET reminder_sent = 1 WHERE appointment_id = ?", (r["appointment_id"],))
-        conn.commit()
-
 async def start_background_loop():
     """Lightweight native asyncio loop for daily digests & hourly reminders."""
     while True:
         try:
             now_sast = datetime.datetime.now(SAST_TIMEZONE)
-            # Run morning digest if it's 09:00 SAST
             if now_sast.hour == 9 and now_sast.minute == 0:
                 await dispatch_daily_morning_digest()
-            # Run hourly reminder checks
             if now_sast.minute == 0:
                 await dispatch_customer_appointment_reminders()
         except Exception as e:
             logger.error(f"Error in background scheduler loop: {e}")
         await asyncio.sleep(60)
 
-# =====================================================================
-# 10. LIFESPAN, FASTAPI ROUTES & ONBOARDING API
-# =====================================================================
+### =====================================================================
+### 10. LIFESPAN, FASTAPI ROUTES & WEBHOOKS
+### =====================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    logger.info("Project Wanda 2 database initialized with WAL mode, multi-tenancy & billing schemas.")
+    seed_test_data()  # <--- AUTOMATIC WIPE & SEED ON STARTUP
+    logger.info("Project Wanda 2 database initialized and seeded with full test data.")
     bg_task = asyncio.create_task(start_background_loop())
     yield
     bg_task.cancel()
@@ -1829,10 +1969,9 @@ async def yoco_webhook_handler(request: Request):
         event_type = payload.get("type")
         data = payload.get("data", {})
         metadata = data.get("metadata", {})
-        
         tenant_id = metadata.get("tenant_id")
         invoice_id = metadata.get("invoice_id")
-        
+
         if event_type == "payment.succeeded":
             with get_db_connection() as conn:
                 cursor = conn.cursor()
@@ -1852,7 +1991,7 @@ async def yoco_webhook_handler(request: Request):
                     )
                 conn.commit()
             return JSONResponse(content={"status": "success", "action": "payment_recorded"})
-        
+
         return JSONResponse(content={"status": "ignored"})
     except Exception as e:
         logger.error(f"Yoco webhook parsing error: {e}")
