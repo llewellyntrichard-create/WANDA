@@ -798,8 +798,8 @@ def get_tenant_whatsapp_credentials(business_id: str) -> Tuple[str, str]:
             return pid or PHONE_NUMBER_ID, tok or WHATSAPP_TOKEN
         return PHONE_NUMBER_ID, WHATSAPP_TOKEN
 
-def get_tenant_yoco_credentials(business_id: str) -> Dict[str, str]:
-    """Retrieves tenant-specific Yoco API credentials for direct merchant payouts."""
+def get_tenant_yoco_credentials(business_id: str) -> Optional[Dict[str, str]]:
+    """Retrieves tenant-specific Yoco API credentials. Returns None if no merchant key is configured (no global fallback)."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -808,14 +808,13 @@ def get_tenant_yoco_credentials(business_id: str) -> Dict[str, str]:
         )
         row = cursor.fetchone()
         if row and row["yoco_secret_key"]:
-            return {
-                "yoco_secret_key": decrypt_secret(row["yoco_secret_key"]),
-                "yoco_public_key": row["yoco_public_key"] or ""
-            }
-        return {
-            "yoco_secret_key": YOCO_SECRET_KEY,
-            "yoco_public_key": ""
-        }
+            decrypted = decrypt_secret(row["yoco_secret_key"])
+            if decrypted and decrypted.strip():
+                return {
+                    "yoco_secret_key": decrypted,
+                    "yoco_public_key": row["yoco_public_key"] or ""
+                }
+        return None
 
 def is_owner_phone(business_id: str, sender_phone: str) -> bool:
     """Validates if sender matches the authorized manager number via normalized comparison."""
@@ -1060,11 +1059,14 @@ def create_yoco_checkout_link(
     amount_zar: float,
     description: str,
     metadata: Optional[Dict[str, Any]] = None
-) -> Tuple[str, str]:
-    """Generates a Yoco Checkout link using tenant-specific merchant keys."""
+) -> Tuple[Optional[str], Optional[str]]:
+    """Generates a Yoco Checkout link using tenant-specific merchant keys. Returns (None, None) if no key is configured."""
     creds = get_tenant_yoco_credentials(business_id)
-    sec_key = creds.get("yoco_secret_key", YOCO_SECRET_KEY)
+    if not creds or not creds.get("yoco_secret_key"):
+        logger.warning(f"No Yoco merchant API key configured for tenant {business_id}")
+        return None, None
     
+    sec_key = creds["yoco_secret_key"]
     checkout_id = f"chk_{uuid.uuid4().hex[:12]}"
     checkout_url = f"https://pay.yoco.com/checkout/{checkout_id}"
     logger.info(f"Created Yoco checkout {checkout_id} for tenant {business_id} ({amount_zar} ZAR)")
@@ -1531,6 +1533,10 @@ def run_customer_agent(
 
     def request_invoice_quote(product_id: str, quantity: int = 1) -> str:
         """Generates an instant invoice and Yoco payment link for a customer catalog item."""
+        creds = get_tenant_yoco_credentials(business_id)
+        if not creds:
+            return "Online payment functionality is not currently enabled for this business. Please contact the business owner directly for manual EFT or cash payment instructions."
+
         cid = ensure_client_persisted(business_id, customer_phone)
         catalog = search_catalog(business_id)
         prod = next((p for p in catalog if p["product_id"] == product_id), None)
@@ -1544,6 +1550,8 @@ def run_customer_agent(
             [{"description": f"{prod['product_name']} x{quantity}", "qty": quantity, "unit_price": unit_cost, "amount": total}],
             total
         )
+        if not checkout_url:
+            return f"Invoice {inv_id} created for R{total:.2f}. Note: Online payment functionality is not enabled for this business. Please contact the owner for manual payment instructions."
         return f"Invoice {inv_id} created for R{total:.2f}. Pay securely via Yoco: {checkout_url}"
 
     def submit_lead_and_order_request(name: str, surname: str, email: str, address: str, product_id: str, quantity: int = 1) -> str:
@@ -1799,18 +1807,25 @@ def run_owner_agent(
 
     def create_customer_invoice_link(customer_phone: str, description: str, amount_zar: float) -> str:
         """Owner utility to generate and send a Yoco payment link directly to a client."""
+        creds = get_tenant_yoco_credentials(business_id)
+        if not creds:
+            return "Online payment functionality is not enabled for this business account because no Yoco API key is configured. Please configure your Yoco API key in tenant settings."
+
         cid = ensure_client_persisted(business_id, customer_phone)
         inv_id, chk_url = create_customer_invoice(
             business_id, cid,
             [{"description": description, "qty": 1, "unit_price": amount_zar, "amount": amount_zar}],
             amount_zar
         )
-        send_whatsapp_message(
-            recipient_phone=customer_phone,
-            message_text=f"💳 *Invoice from {business_name}*\nDescription: {description}\nTotal Amount: R{amount_zar:.2f}\nPay via Yoco: {chk_url}",
-            business_id=business_id
-        )
-        return f"Invoice {inv_id} dispatched to +{customer_phone} with Yoco link: {chk_url}"
+        if chk_url:
+            send_whatsapp_message(
+                recipient_phone=customer_phone,
+                message_text=f"💳 *Invoice from {business_name}*\nDescription: {description}\nTotal Amount: R{amount_zar:.2f}\nPay via Yoco: {chk_url}",
+                business_id=business_id
+            )
+            return f"Invoice {inv_id} dispatched to +{customer_phone} with Yoco link: {chk_url}"
+        else:
+            return f"Invoice {inv_id} created for R{amount_zar:.2f}, but online payment link could not be generated as no Yoco API key is configured for this business."
 
     def toggle_live_takeover(active: bool) -> str:
         """Toggles Live Human Takeover mode on or off for customer chats."""
@@ -2217,7 +2232,8 @@ def reset_and_init_production_db() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    reset_and_init_production_db()
+    # Safe production initialization: preserves database records across container restarts
+    init_db()
     logger.info("Project Wanda 2 Beta 1 production engine initialized and ready for business onboarding.")
     bg_task = asyncio.create_task(start_background_loop())
     yield
