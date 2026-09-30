@@ -15,17 +15,12 @@ from typing import List, Dict, Any, Optional, Tuple, Union
 import requests
 import httpx
 import pytz
-from fastapi import FastAPI, Request, HTTPException, Query, BackgroundTasks, status
+from fastapi import FastAPI, Request, HTTPException, Query, BackgroundTasks, status, Depends, Header
 from fastapi.responses import PlainTextResponse, JSONResponse
-
-try:
-    from google import genai
-    from google.genai import types
-except ImportError:
-    genai = None
-    types = None
-
+from fastapi.security import APIKeyHeader
+from cryptography.fernet import Fernet
 from dotenv import load_dotenv
+
 load_dotenv()
 
 ### =====================================================================
@@ -38,8 +33,18 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
 APP_SECRET = os.getenv("META_APP_SECRET", "")
 YOCO_SECRET_KEY = os.getenv("YOCO_SECRET_KEY", "sk_test_mock_yoco_key")
+YOCO_WEBHOOK_SECRET = os.getenv("YOCO_WEBHOOK_SECRET", "")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "admin_secret_key_change_me")
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
+WANDA_ENCRYPTION_KEY = os.getenv("WANDA_ENCRYPTION_KEY", "")
+
 META_API_VERSION = "v21.0"
 SAST_TIMEZONE = pytz.timezone("Africa/Johannesburg")
+
+# Modular Feature Component Identifiers
+FEAT_FRONT_DESK = "FEAT_FRONT_DESK"
+FEAT_SCHEDULING = "FEAT_SCHEDULING"
+FEAT_INVOICING = "FEAT_INVOICING"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,10 +52,70 @@ logging.basicConfig(
 )
 logger = logging.getLogger("wanda2")
 
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
+
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if (genai and GEMINI_API_KEY) else None
 
+cipher = Fernet(WANDA_ENCRYPTION_KEY.encode()) if WANDA_ENCRYPTION_KEY else None
+api_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
+
 ### =====================================================================
-### 1. DATABASE SCHEMA & ACCESS LAYER
+### SECURITY & CRYPTOGRAPHY UTILITIES
+### =====================================================================
+def encrypt_secret(val: str) -> str:
+    """Symmetrically encrypts sensitive credentials using Fernet before DB write."""
+    if not val or not cipher:
+        return val
+    try:
+        return cipher.encrypt(val.encode("utf-8")).decode("utf-8")
+    except Exception as e:
+        logger.error(f"Encryption error: {e}")
+        return val
+
+def decrypt_secret(val: str) -> str:
+    """Decrypts at-rest credentials retrieved from SQLite."""
+    if not val or not cipher:
+        return val
+    try:
+        return cipher.decrypt(val.encode("utf-8")).decode("utf-8")
+    except Exception:
+        return val  # Fallback for unencrypted historical values
+
+def verify_admin_key(api_key: Optional[str] = Depends(api_key_header)) -> str:
+    """Enforces X-Admin-Key authentication on administrative and onboarding endpoints."""
+    if not api_key or api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: Invalid Admin Key")
+    return api_key
+
+def verify_yoco_signature(raw_payload: bytes, signature_header: Optional[str]) -> bool:
+    """Validates Yoco payment notification webhooks using HMAC-SHA256."""
+    if not signature_header or not YOCO_WEBHOOK_SECRET:
+        return False
+    try:
+        parts = dict(item.split("=") for item in signature_header.split(","))
+        timestamp = parts.get("webhook-timestamp")
+        expected_sig = parts.get("webhook-signature")
+    except Exception:
+        return False
+
+    if not timestamp or not expected_sig:
+        return False
+
+    signed_payload = f"{timestamp}.{raw_payload.decode('utf-8')}"
+    computed_hmac = hmac.new(
+        key=YOCO_WEBHOOK_SECRET.encode("utf-8"),
+        msg=signed_payload.encode("utf-8"),
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(computed_hmac, expected_sig)
+
+### =====================================================================
+### 1. DATABASE SCHEMA & ACCESS LAYER (BETA 1 EXTENDED)
 ### =====================================================================
 def get_db_connection() -> sqlite3.Connection:
     """Creates a database connection with dict row access, foreign keys, and write timeout."""
@@ -65,17 +130,24 @@ def init_db() -> None:
         conn.execute("PRAGMA journal_mode = WAL;")
         cursor = conn.cursor()
         cursor.executescript("""
-            -- Master Business Tenant Profile
+            -- Master Business Tenant Profile (Beta 1 Tax & Profile Extensions)
             CREATE TABLE IF NOT EXISTS business_info (
                 business_id TEXT PRIMARY KEY,
                 business_name TEXT,
                 primary_mail TEXT,
                 primary_e_mail TEXT,
                 website TEXT,
-                core_business TEXT
+                core_business TEXT,
+                about_business TEXT,
+                business_rules TEXT,
+                company_reg_number TEXT,
+                vat_number TEXT,
+                billing_address TEXT,
+                billing_email TEXT,
+                external_billing_account_id TEXT
             );
 
-            -- Per-Tenant WhatsApp Credentials (Multi-Tenant Isolation)
+            -- Per-Tenant WhatsApp Credentials (Multi-Tenant Isolation & At-Rest Encryption)
             CREATE TABLE IF NOT EXISTS business_whatsapp (
                 business_id TEXT,
                 w_number TEXT PRIMARY KEY,
@@ -84,7 +156,7 @@ def init_db() -> None:
                 FOREIGN KEY (business_id) REFERENCES business_info(business_id)
             );
 
-            -- Per-Tenant Yoco Merchant Credentials (Direct Merchant Payouts)
+            -- Per-Tenant Yoco Merchant Credentials
             CREATE TABLE IF NOT EXISTS business_yoco (
                 business_id TEXT PRIMARY KEY,
                 yoco_secret_key TEXT NOT NULL,
@@ -154,7 +226,7 @@ def init_db() -> None:
                 FOREIGN KEY (business_id) REFERENCES business_info(business_id)
             );
 
-            -- Customer CRM Directory with Geometry Tracking
+            -- Customer CRM Directory with POPIA Consent State Tracking
             CREATE TABLE IF NOT EXISTS client_table (
                 customer_id TEXT PRIMARY KEY,
                 business_id TEXT,
@@ -166,6 +238,7 @@ def init_db() -> None:
                 latitude REAL,
                 longitude REAL,
                 first_contact_source TEXT DEFAULT 'WHATSAPP_INBOUND',
+                consent_granted INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (business_id) REFERENCES business_info(business_id)
             );
@@ -195,7 +268,7 @@ def init_db() -> None:
                 FOREIGN KEY(business_id) REFERENCES business_info(business_id)
             );
 
-            -- Customer Appointments (60-min slots, 40-min buffers, lifecycle status, CSAT, Reminders)
+            -- Customer Appointments (60-min slots, dynamic buffers, CSAT, Reminders)
             CREATE TABLE IF NOT EXISTS customer_appointments (
                 appointment_id TEXT PRIMARY KEY,
                 business_id TEXT NOT NULL,
@@ -251,7 +324,6 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_chat_history 
             ON chat_history (business_id, sender_phone, created_at);
 
-            -- Isolated Conversation Audit Log
             CREATE TABLE IF NOT EXISTS conversation_audit_log (
                 log_id TEXT PRIMARY KEY,
                 business_id TEXT NOT NULL,
@@ -264,7 +336,6 @@ def init_db() -> None:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- Dedicated System Diagnostic Log
             CREATE TABLE IF NOT EXISTS system_event_log (
                 event_id TEXT PRIMARY KEY,
                 business_id TEXT,
@@ -275,11 +346,7 @@ def init_db() -> None:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- =========================================================
-            -- ENTERPRISE, USAGE & BILLING TABLES
-            -- =========================================================
-            
-            -- Token & Message Usage Tracking
+            -- Token & Message Metering Tables
             CREATE TABLE IF NOT EXISTS tenant_token_usage (
                 usage_id TEXT PRIMARY KEY,
                 tenant_id TEXT NOT NULL,
@@ -291,7 +358,15 @@ def init_db() -> None:
                 FOREIGN KEY (tenant_id) REFERENCES business_info(business_id)
             );
 
-            -- Tenant Subscription & Quota Limits
+            CREATE TABLE IF NOT EXISTS tenant_message_usage (
+                usage_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                message_direction TEXT NOT NULL,
+                channel TEXT DEFAULT 'WHATSAPP',
+                FOREIGN KEY (tenant_id) REFERENCES business_info(business_id)
+            );
+
             CREATE TABLE IF NOT EXISTS tenant_quotas (
                 tenant_id TEXT PRIMARY KEY,
                 monthly_token_quota INTEGER DEFAULT 500000,
@@ -307,6 +382,9 @@ def init_db() -> None:
                 subscription_status TEXT DEFAULT 'ACTIVE',
                 next_billing_date TEXT,
                 yoco_customer_id TEXT,
+                billing_cycle TEXT DEFAULT 'MONTHLY',
+                external_subscription_id TEXT,
+                last_billing_sync_at DATETIME,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (tenant_id) REFERENCES business_info(business_id)
             );
@@ -336,7 +414,98 @@ def init_db() -> None:
                 amount REAL NOT NULL,
                 FOREIGN KEY (invoice_id) REFERENCES invoices(invoice_id)
             );
+
+            -- Modular Feature Catalog & Holding Pricing
+            CREATE TABLE IF NOT EXISTS platform_feature_catalog (
+                feature_code TEXT PRIMARY KEY,
+                feature_name TEXT NOT NULL,
+                default_price_zar REAL DEFAULT 0.0,
+                billing_period TEXT DEFAULT 'MONTHLY',
+                description TEXT
+            );
+
+            -- Tenant Feature Entitlements & Pricing Overrides
+            CREATE TABLE IF NOT EXISTS tenant_feature_entitlements (
+                entitlement_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                feature_code TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                custom_price_zar REAL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (tenant_id) REFERENCES business_info(business_id),
+                FOREIGN KEY (feature_code) REFERENCES platform_feature_catalog(feature_code),
+                UNIQUE(tenant_id, feature_code)
+            );
         """)
+        conn.commit()
+
+        # Dynamic Schema Migration Helpers for existing databases
+        migrations = [
+            ("business_info", "about_business TEXT"),
+            ("business_info", "business_rules TEXT"),
+            ("business_info", "company_reg_number TEXT"),
+            ("business_info", "vat_number TEXT"),
+            ("business_info", "billing_address TEXT"),
+            ("business_info", "billing_email TEXT"),
+            ("business_info", "external_billing_account_id TEXT"),
+            ("client_table", "consent_granted INTEGER DEFAULT 0"),
+            ("tenant_subscriptions", "billing_cycle TEXT DEFAULT 'MONTHLY'"),
+            ("tenant_subscriptions", "external_subscription_id TEXT"),
+            ("tenant_subscriptions", "last_billing_sync_at DATETIME")
+        ]
+        for tbl, col_def in migrations:
+            try:
+                cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN {col_def};")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+        conn.commit()
+
+    seed_feature_catalog()
+
+def seed_feature_catalog() -> None:
+    """Initializes platform component packages and default holding prices."""
+    features = [
+        (FEAT_FRONT_DESK, "Virtual Front Desk & Communications", 450.00, "Catalog inquiries, event publishing, escalations & client relays"),
+        (FEAT_SCHEDULING, "Smart Scheduling & Booking Engine", 650.00, "In-chat booking, traffic buffers, GPS site lookup, morning digest & reminders"),
+        (FEAT_INVOICING, "Digital Invoicing & Payment Engine", 350.00, "Instant itemized quoting, Yoco checkout generation & payment reconciliations"),
+    ]
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        for code, name, price, desc in features:
+            cursor.execute("""
+                INSERT OR IGNORE INTO platform_feature_catalog (feature_code, feature_name, default_price_zar, description)
+                VALUES (?, ?, ?, ?)
+            """, (code, name, price, desc))
+        conn.commit()
+
+def is_feature_enabled(business_id: str, feature_code: str) -> bool:
+    """Checks whether a tenant has an active entitlement for a specific component."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT is_active FROM tenant_feature_entitlements
+            WHERE tenant_id = ? AND feature_code = ?
+        """, (business_id, feature_code))
+        row = cursor.fetchone()
+        return bool(row["is_active"]) if row else True  # Default enabled if unset
+
+def set_tenant_feature_state(
+    business_id: str,
+    feature_code: str,
+    active: bool,
+    custom_price_zar: Optional[float] = None
+) -> None:
+    """Activates or deactivates a platform feature for a tenant and updates custom pricing."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO tenant_feature_entitlements (entitlement_id, tenant_id, feature_code, is_active, custom_price_zar, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(tenant_id, feature_code) DO UPDATE SET
+                is_active = excluded.is_active,
+                custom_price_zar = COALESCE(excluded.custom_price_zar, tenant_feature_entitlements.custom_price_zar),
+                updated_at = CURRENT_TIMESTAMP
+        """, (generate_custom_id("ent"), business_id, feature_code, 1 if active else 0, custom_price_zar))
         conn.commit()
 
 def seed_test_data() -> None:
@@ -351,7 +520,8 @@ def seed_test_data() -> None:
             "service_area", "client_table", "reminder_table", "business_events",
             "customer_appointments", "open_queries", "query_items", "chat_history",
             "conversation_audit_log", "system_event_log", "tenant_token_usage",
-            "tenant_quotas", "tenant_subscriptions", "invoices", "invoice_items"
+            "tenant_message_usage", "tenant_quotas", "tenant_subscriptions",
+            "invoices", "invoice_items", "tenant_feature_entitlements"
         ]
 
         logger.info("Wiping existing database tables on startup...")
@@ -370,10 +540,17 @@ def seed_test_data() -> None:
         WA_BUSINESS_NUM = "27788109754"   # WhatsApp Line: 0788109754
         OWNER_PHONE_NUM = "27716850167"   # Owner Phone:   0716850167
 
-        # 1. Tenant Business Profile & Numbers
+        # 1. Tenant Business Profile & Tax Details
         cursor.execute("""
-            INSERT INTO business_info (business_id, business_name, primary_mail, primary_e_mail, website, core_business)
-            VALUES (?, ?, ?, 'info@apexplumbing.co.za', 'https://www.apexplumbing.co.za', 'Emergency Residential & Commercial Plumbing Services')
+            INSERT INTO business_info (
+                business_id, business_name, primary_mail, primary_e_mail, website, core_business,
+                about_business, business_rules, company_reg_number, vat_number, billing_address, billing_email
+            )
+            VALUES (?, ?, ?, 'info@apexplumbing.co.za', 'https://www.apexplumbing.co.za', 
+                    'Emergency Residential & Commercial Plumbing Services',
+                    'Apex Plumbing Services is Gauteng premier emergency plumbing contractor with over 15 years of industry experience.',
+                    'Exclusions: We do not service solar water heaters or specialized industrial boilers. Call-outs restricted to Gauteng suburbs.',
+                    '2021/123456/07', '4120987654', '12 Main Road, Sandton, Johannesburg', 'billing@apexplumbing.co.za')
         """, (BIZ_ID, BIZ_NAME, OWNER_PHONE_NUM))
 
         wa_phone_id = PHONE_NUMBER_ID.strip() if PHONE_NUMBER_ID else '1348277451695205'
@@ -382,12 +559,12 @@ def seed_test_data() -> None:
         cursor.execute("""
             INSERT INTO business_whatsapp (business_id, w_number, phone_number_id, access_token)
             VALUES (?, ?, ?, ?)
-        """, (BIZ_ID, WA_BUSINESS_NUM, wa_phone_id, wa_access_token))
+        """, (BIZ_ID, WA_BUSINESS_NUM, wa_phone_id, encrypt_secret(wa_access_token)))
 
         cursor.execute("""
             INSERT INTO business_yoco (business_id, yoco_secret_key, yoco_public_key)
-            VALUES (?, 'sk_test_tenant_secret_key_12345', 'pk_test_tenant_public_key_12345')
-        """, (BIZ_ID,))
+            VALUES (?, ?, 'pk_test_tenant_public_key_12345')
+        """, (BIZ_ID, encrypt_secret('sk_test_tenant_secret_key_12345')))
 
         cursor.execute("""
             INSERT INTO human_escalation (business_id, man_number, response_time, takeover_active)
@@ -419,6 +596,13 @@ def seed_test_data() -> None:
             VALUES (?, 500000, 50000, 2000, 300)
         """, (BIZ_ID,))
 
+        # Enable all 3 modular features for the default tenant
+        for feat_code in [FEAT_FRONT_DESK, FEAT_SCHEDULING, FEAT_INVOICING]:
+            cursor.execute("""
+                INSERT INTO tenant_feature_entitlements (entitlement_id, tenant_id, feature_code, is_active, updated_at)
+                VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+            """, (generate_custom_id("ent"), BIZ_ID, feat_code))
+
         # 2. Product Catalog with Prices for Gemini AI
         products = [
             ("prod_callout", "Standard Call-Out & Inspection", "Service", "per visit", 450.0, "Residential Plumbing", "Same Day", "Non-refundable diagnostic fee."),
@@ -446,13 +630,13 @@ def seed_test_data() -> None:
         """, (BIZ_ID,))
 
         cursor.execute("""
-            INSERT INTO client_table (customer_id, business_id, name, surname, mobile_number, email, address, latitude, longitude, first_contact_source)
-            VALUES ('cust_john', ?, 'John', 'Smith', '27821112222', 'john@example.com', '14 Rosebank Road, Sandton', -26.1075, 28.0567, 'WHATSAPP_INBOUND')
+            INSERT INTO client_table (customer_id, business_id, name, surname, mobile_number, email, address, latitude, longitude, first_contact_source, consent_granted)
+            VALUES ('cust_john', ?, 'John', 'Smith', '27821112222', 'john@example.com', '14 Rosebank Road, Sandton', -26.1075, 28.0567, 'WHATSAPP_INBOUND', 1)
         """, (BIZ_ID,))
 
         cursor.execute("""
-            INSERT INTO client_table (customer_id, business_id, name, surname, mobile_number, email, address, latitude, longitude, first_contact_source)
-            VALUES ('cust_sarah', ?, 'Sarah', 'Connor', '27833334444', 'sarah@example.com', '22 Bryanston Drive, Bryanston', -26.0560, 28.0240, 'WHATSAPP_INBOUND')
+            INSERT INTO client_table (customer_id, business_id, name, surname, mobile_number, email, address, latitude, longitude, first_contact_source, consent_granted)
+            VALUES ('cust_sarah', ?, 'Sarah', 'Connor', '27833334444', 'sarah@example.com', '22 Bryanston Drive, Bryanston', -26.0560, 28.0240, 'WHATSAPP_INBOUND', 1)
         """, (BIZ_ID,))
 
         cursor.execute("""
@@ -506,6 +690,13 @@ def log_conversation(
                 """,
                 (generate_custom_id("cal"), business_id, normalize_phone(sender_phone), direction, message_type, text, media_url)
             )
+            cursor.execute(
+                """
+                INSERT INTO tenant_message_usage (usage_id, tenant_id, message_direction, channel)
+                VALUES (?, ?, ?, 'WHATSAPP')
+                """,
+                (generate_custom_id("msg_usg"), business_id, direction)
+            )
             conn.commit()
     except Exception as e:
         logger.error(f"Failed to write conversation audit log: {e}")
@@ -518,7 +709,6 @@ def log_system_event(
     context: Optional[str] = None
 ) -> None:
     """Logs system events, errors, tool calls, and diagnostics to SQLite and stdout."""
-    # Emit to console for Railway Deploy Logs streaming
     print(f"[{severity}] [{component}] {message}" + (f" (Tenant: {business_id})" if business_id else ""), flush=True)
     try:
         with get_db_connection() as conn:
@@ -583,10 +773,10 @@ def resolve_business_id_from_destination(destination_number: str) -> Optional[st
         row = cursor.fetchone()
         if row and row["business_id"]:
             return row["business_id"]
-        # Fallback to default seeded tenant
+        
         cursor.execute("SELECT business_id FROM business_info LIMIT 1")
         default_row = cursor.fetchone()
-        return default_row["business_id"] if default_row else "tenant_apex_plumbing" 
+        return default_row["business_id"] if default_row else "tenant_apex_plumbing"
 
 def get_tenant_whatsapp_credentials(business_id: str) -> Tuple[str, str]:
     """Retrieves tenant-specific WhatsApp credentials or falls back to environment defaults."""
@@ -599,8 +789,8 @@ def get_tenant_whatsapp_credentials(business_id: str) -> Tuple[str, str]:
         row = cursor.fetchone()
         if row and row["phone_number_id"] and row["access_token"]:
             pid = row["phone_number_id"]
-            tok = row["access_token"]
-            # Fallback if DB contains dummy placeholder values
+            raw_tok = row["access_token"]
+            tok = decrypt_secret(raw_tok)
             if tok.startswith("EAAG_TEST_") or not tok:
                 tok = WHATSAPP_TOKEN
             if pid == "1348277451695205" or not pid:
@@ -619,7 +809,7 @@ def get_tenant_yoco_credentials(business_id: str) -> Dict[str, str]:
         row = cursor.fetchone()
         if row and row["yoco_secret_key"]:
             return {
-                "yoco_secret_key": row["yoco_secret_key"],
+                "yoco_secret_key": decrypt_secret(row["yoco_secret_key"]),
                 "yoco_public_key": row["yoco_public_key"] or ""
             }
         return {
@@ -813,20 +1003,16 @@ def check_tenant_quota(business_id: str) -> Tuple[bool, str]:
     """Validates subscription status and checks daily/monthly token and message quotas."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        
-        # Check Subscription State
         cursor.execute("SELECT subscription_status FROM tenant_subscriptions WHERE tenant_id = ?", (business_id,))
         sub_row = cursor.fetchone()
         if sub_row and sub_row["subscription_status"] in ["LAPSED", "SUSPENDED"]:
-            return False, "Subscription is currently LAPSED. Please renew via Yoco billing link."
+            return False, "Subscription is currently LAPSED or SUSPENDED. Please renew subscription."
 
-        # Fetch Quota Limits
         cursor.execute("SELECT * FROM tenant_quotas WHERE tenant_id = ?", (business_id,))
         quota = cursor.fetchone()
         if not quota:
             return True, "Quota OK (Default)"
 
-        # Calculate Today's Token Usage
         today_str = datetime.date.today().isoformat()
         cursor.execute(
             """
@@ -875,16 +1061,13 @@ def create_yoco_checkout_link(
     description: str,
     metadata: Optional[Dict[str, Any]] = None
 ) -> Tuple[str, str]:
-    """
-    Generates a Yoco Checkout link for South African Rand (ZAR) payments using tenant-specific merchant keys.
-    Returns (checkout_id, checkout_url).
-    """
+    """Generates a Yoco Checkout link using tenant-specific merchant keys."""
     creds = get_tenant_yoco_credentials(business_id)
     sec_key = creds.get("yoco_secret_key", YOCO_SECRET_KEY)
     
     checkout_id = f"chk_{uuid.uuid4().hex[:12]}"
     checkout_url = f"https://pay.yoco.com/checkout/{checkout_id}"
-    logger.info(f"Created Yoco checkout {checkout_id} for tenant {business_id} ({amount_zar} ZAR) using key prefix {sec_key[:8]}...")
+    logger.info(f"Created Yoco checkout {checkout_id} for tenant {business_id} ({amount_zar} ZAR)")
     return checkout_id, checkout_url
 
 def create_customer_invoice(
@@ -1007,7 +1190,7 @@ async def download_meta_audio(media_id: str, business_id: Optional[str] = None) 
         return audio_res.content
 
 ### =====================================================================
-### 5. ADVANCED SCHEDULING ENGINE (40-MIN BUFFERS & CONFLICT CHECKS)
+### 5. DYNAMIC TRAFFIC SCHEDULING ENGINE (BETA 1 DYNAMIC BUFFERS)
 ### =====================================================================
 def is_within_operating_hours(business_id: str, date_str: str, start_time_str: str, end_time_str: str) -> Tuple[bool, str]:
     """Validates that requested slot falls within the tenant's configured operating hours."""
@@ -1034,18 +1217,45 @@ def is_within_operating_hours(business_id: str, date_str: str, start_time_str: s
 
         if req_start < op_start or req_end > op_end:
             return False, f"Requested time is outside operating hours ({day_schedule.strip()})."
+
         return True, ""
     except Exception as e:
         log_system_event("WARN", "HOURS_CHECK", f"Could not parse hours: {e}", business_id=business_id)
         return True, ""
 
-def check_appointment_conflict_with_buffer(
+def calculate_dynamic_travel_buffer(origin: str, destination: str, departure_epoch: int) -> int:
+    """Calculates travel time using Google Maps Distance Matrix API and adds a 15-minute prep buffer."""
+    if not GOOGLE_MAPS_API_KEY or not origin or not destination:
+        return 40  # Fallback buffer
+
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    params = {
+        "origins": origin,
+        "destinations": destination,
+        "departure_time": departure_epoch,
+        "key": GOOGLE_MAPS_API_KEY
+    }
+    try:
+        res = requests.get(url, params=params, timeout=5.0)
+        data = res.json()
+        if data.get("status") == "OK":
+            element = data["rows"][0]["elements"][0]
+            if element.get("status") == "OK":
+                duration_data = element.get("duration_in_traffic", element.get("duration", {}))
+                travel_mins = duration_data.get("value", 1500) // 60
+                return travel_mins + 15
+    except Exception as e:
+        logger.error(f"Routing calculation error: {e}")
+
+    return 40
+
+def check_appointment_conflict_dynamic(
     business_id: str,
     date_str: str,
     start_time_str: str,
-    buffer_minutes: int = 40
+    target_address: str = ""
 ) -> Tuple[bool, str]:
-    """Enforces a strict 40-minute buffer window around existing commitments (60-min slots)."""
+    """Enforces dynamic travel buffers based on Google Maps traffic data."""
     fmt = "%H:%M"
     try:
         req_start_dt = datetime.datetime.strptime(start_time_str, fmt)
@@ -1056,65 +1266,43 @@ def check_appointment_conflict_with_buffer(
         if not valid_hours:
             return False, reason
 
-        req_envelope_start = (req_start_dt - datetime.timedelta(minutes=buffer_minutes)).time()
-        req_envelope_end = (req_end_dt + datetime.timedelta(minutes=buffer_minutes)).time()
-
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT appointment_id, subject, start_time, end_time
+                SELECT appointment_id, subject, start_time, end_time, location
                 FROM customer_appointments
                 WHERE business_id = ?
                   AND appointment_date = ?
                   AND status IN ('CONFIRMED', 'PENDING_CONFIRMATION')
+                ORDER BY start_time ASC
                 """,
                 (business_id, date_str)
             )
-            for row in cursor.fetchall():
-                b_start = datetime.datetime.strptime(row["start_time"], fmt).time()
-                b_end = datetime.datetime.strptime(row["end_time"], fmt).time()
+            daily_appts = cursor.fetchall()
 
-                if not (req_envelope_end <= b_start or req_envelope_start >= b_end):
-                    return False, f"Time conflict! An existing appointment '{row['subject']}' is booked ({row['start_time']}-{row['end_time']}). A {buffer_minutes}-min travel buffer is required."
+        target_dt = datetime.datetime.strptime(f"{date_str} {start_time_str}", f"%Y-%m-%d {fmt}")
+        target_epoch = int(SAST_TIMEZONE.localize(target_dt).timestamp())
+
+        for row in daily_appts:
+            b_start = datetime.datetime.strptime(row["start_time"], fmt)
+            b_end = datetime.datetime.strptime(row["end_time"], fmt)
+            b_loc = row["location"] or ""
+
+            if req_end_dt <= b_start:
+                buf = calculate_dynamic_travel_buffer(target_address, b_loc, target_epoch + 3600)
+                if req_end_dt + datetime.timedelta(minutes=buf) > b_start:
+                    return False, f"Traffic buffer conflict! You need {buf} minutes travel time to reach next appointment '{row['subject']}' at {row['start_time']}."
+            elif req_start_dt >= b_end:
+                buf = calculate_dynamic_travel_buffer(b_loc, target_address, target_epoch)
+                if b_end + datetime.timedelta(minutes=buf) > req_start_dt:
+                    return False, f"Traffic buffer conflict! You need {buf} minutes travel and prep time after completing '{row['subject']}' at {row['end_time']}."
+            else:
+                return False, f"Direct slot conflict! You are already booked for '{row['subject']}' ({row['start_time']}-{row['end_time']})."
 
         return True, req_end_str
     except ValueError as e:
         return False, f"Invalid time/date formatting: {e}"
-
-async def dispatch_customer_appointment_reminders() -> None:
-    """Background worker sending automated 24-hour advance WhatsApp reminders."""
-    tomorrow_str = (datetime.datetime.now(SAST_TIMEZONE) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-    logger.info(f"Checking for 24h customer appointment reminders for {tomorrow_str}")
-
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT a.appointment_id, a.business_id, a.subject, a.start_time, a.location, c.name, c.mobile_number
-            FROM customer_appointments a
-            JOIN client_table c ON a.customer_id = c.customer_id
-            WHERE a.appointment_date = ?
-              AND a.status = 'CONFIRMED'
-              AND a.reminder_sent = 0
-            """,
-            (tomorrow_str,)
-        )
-        reminders = cursor.fetchall()
-
-        for r in reminders:
-            msg = (
-                f"🔔 *Friendly Reminder:* Hi {r['name']}, you have an upcoming service appointment tomorrow ({tomorrow_str}) "
-                f"at {r['start_time']} for '{r['subject']}' ({r['location'] or 'On site'}). "
-                f"Please let us know if you need to reschedule!"
-            )
-            await send_whatsapp_message_async(recipient_phone=r['mobile_number'], message_text=msg, business_id=r['business_id'])
-            
-            cursor.execute(
-                "UPDATE customer_appointments SET reminder_sent = 1 WHERE appointment_id = ?",
-                (r['appointment_id'],)
-            )
-        conn.commit()
 
 ### =====================================================================
 ### 6. SITE CLIENT HISTORY & HAVERSINE SPATIAL LOOKUP
@@ -1207,13 +1395,17 @@ def run_customer_agent(
 
     business_data = fetch_business_profile(business_id)
     business_name = business_data.get("business_name", "the business")
+    about_text = business_data.get("about_business", "Not specified")
+    rules_text = business_data.get("business_rules", "None specified")
 
     def get_business_overview() -> str:
-        """Retrieves company description, contact email, and core business overview."""
+        """Retrieves company description, background, rules, and contact info."""
         info = fetch_business_profile(business_id)
         return (
             f"Business: {info.get('business_name')}\n"
-            f"Overview: {info.get('core_business')}\n"
+            f"Core Focus: {info.get('core_business')}\n"
+            f"About Us: {info.get('about_business', 'N/A')}\n"
+            f"Operating Rules & Exclusions: {info.get('business_rules', 'None specified')}\n"
             f"Website: {info.get('website')}\n"
             f"Email: {info.get('primary_e_mail')}\n"
             f"Phone: {info.get('primary_mail')}"
@@ -1235,7 +1427,7 @@ def run_customer_agent(
         return f"Address: {addr}\nCoverage: {srv.get('service_suburb')}, {srv.get('service_city')}\nCall-out: {srv.get('delivery_cost')}"
 
     def get_products_or_services(search_term: str = "") -> str:
-        """Looks up catalog items, prices, lead times, and warranty policies. Pass empty string '' or 'all' to retrieve all catalog items."""
+        """Looks up catalog items, prices, lead times, and warranty policies."""
         items = search_catalog(business_id, query=search_term)
         if not items:
             return "No matching products or services found."
@@ -1278,8 +1470,8 @@ def run_customer_agent(
             return "\n\n".join(events)
 
     def book_customer_appointment(date: str, start_time: str, service_description: str, address: str = "") -> str:
-        """Books a 60-min service appointment on the owner's schedule with a 40-min buffer check."""
-        is_free, end_time_or_reason = check_appointment_conflict_with_buffer(business_id, date, start_time, 40)
+        """Books a 60-min service appointment dynamically checking Google traffic buffers."""
+        is_free, end_time_or_reason = check_appointment_conflict_dynamic(business_id, date, start_time, address)
         if not is_free:
             return f"BOOKING_UNAVAILABLE: {end_time_or_reason}"
 
@@ -1297,7 +1489,6 @@ def run_customer_agent(
             )
             conn.commit()
 
-        # Instant alert to business owner
         esc = fetch_escalation_details(business_id)
         if esc.get("man_number"):
             send_whatsapp_message(
@@ -1391,16 +1582,37 @@ def run_customer_agent(
             )
         return f"Query escalated to management. Expected turnaround: {resp_time}."
 
+    # Modular Tool Gating
+    active_tools = []
+    if is_feature_enabled(business_id, FEAT_FRONT_DESK):
+        active_tools.extend([
+            get_business_overview,
+            get_trading_hours,
+            get_physical_location_and_service_area,
+            get_products_or_services,
+            get_public_events,
+            submit_lead_and_order_request,
+            escalate_unanswered_query_to_owner
+        ])
+    if is_feature_enabled(business_id, FEAT_SCHEDULING):
+        active_tools.extend([
+            book_customer_appointment,
+            get_customer_appointment_status
+        ])
+    if is_feature_enabled(business_id, FEAT_INVOICING):
+        active_tools.append(request_invoice_quote)
+
     system_instruction = (
         f"You are the official WhatsApp assistant for {business_name}.\n"
+        f"ABOUT: {about_text}\n"
+        f"OPERATING RULES & EXCLUSIONS: {rules_text}\n"
         "STRICT COMPLIANCE RULES:\n"
-        "1. ALWAYS invoke `get_products_or_services` to look up available products, services, prices, warranties, and catalog items.\n"
-        "2. ONLY state facts returned by your tools. Never guess prices, slots, or hours.\n"
-        "3. If requested details are absent after invoking tools, invoke `escalate_unanswered_query_to_owner`.\n"
-        "4. Customers can book appointments using `book_customer_appointment` or check status via `get_customer_appointment_status`.\n"
-        "5. Inquire about public events, expos, and trade shows using `get_public_events`.\n"
-        "6. Generate Yoco invoices using `request_invoice_quote`.\n"
-        "7. ALWAYS reply in polite, concise WhatsApp-formatted text."
+        "1. ALWAYS review 'Operating Rules & Exclusions' from `get_business_overview`.\n"
+        "2. If a customer requests a service, product, or location excluded by business rules, politely decline.\n"
+        "3. ALWAYS invoke `get_products_or_services` to look up available products, services, prices, and warranties.\n"
+        "4. ONLY state facts returned by your tools. Never guess prices, slots, or hours.\n"
+        "5. If requested details are absent, invoke `escalate_unanswered_query_to_owner`.\n"
+        "6. ALWAYS reply in polite, concise WhatsApp-formatted text."
     )
 
     contents_payload: List[Any] = []
@@ -1429,18 +1641,7 @@ def run_customer_agent(
                 contents=contents_payload,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    tools=[
-                        get_business_overview,
-                        get_trading_hours,
-                        get_physical_location_and_service_area,
-                        get_products_or_services,
-                        get_public_events,
-                        book_customer_appointment,
-                        get_customer_appointment_status,
-                        request_invoice_quote,
-                        submit_lead_and_order_request,
-                        escalate_unanswered_query_to_owner,
-                    ],
+                    tools=active_tools,
                     temperature=0.0,
                 ),
             )
@@ -1476,7 +1677,9 @@ def run_owner_agent(
         info = fetch_business_profile(business_id)
         return (
             f"Business: {info.get('business_name')}\n"
-            f"Overview: {info.get('core_business')}\n"
+            f"Core Focus: {info.get('core_business')}\n"
+            f"About Us: {info.get('about_business', 'N/A')}\n"
+            f"Business Rules: {info.get('business_rules', 'None specified')}\n"
             f"Website: {info.get('website')}\n"
             f"Email: {info.get('primary_e_mail')}\n"
             f"Phone: {info.get('primary_mail')}"
@@ -1578,7 +1781,6 @@ def run_owner_agent(
 
             conn.commit()
 
-            # CSAT Automation Trigger on Completion
             if clean_status == "COMPLETED":
                 cursor.execute(
                     "SELECT c.mobile_number, a.subject FROM customer_appointments a JOIN client_table c ON a.customer_id = c.customer_id WHERE a.appointment_id = ? OR (a.start_time = ? AND a.appointment_date = ?)",
@@ -1848,7 +2050,7 @@ async def process_incoming_payload(
     await send_whatsapp_message_async(recipient_phone=sender_phone, message_text=reply_text, business_id=business_id)
 
 ### =====================================================================
-### 9. AUTOMATED BACKGROUND SCHEDULERS (MORNING DIGEST & 24H REMINDERS)
+### 9. AUTOMATED BACKGROUND SCHEDULERS & POPIA 30-DAY RETENTION
 ### =====================================================================
 async def dispatch_daily_morning_digest() -> None:
     """Dispatches daily 09:00 AM SAST agenda summaries to business owners."""
@@ -1861,6 +2063,8 @@ async def dispatch_daily_morning_digest() -> None:
         tenants = cursor.fetchall()
 
         for business_id, owner_phone in tenants:
+            if not is_feature_enabled(business_id, FEAT_SCHEDULING):
+                continue
             cursor.execute(
                 """
                 SELECT start_time, end_time, subject, location
@@ -1893,47 +2097,133 @@ async def dispatch_daily_morning_digest() -> None:
             msg = "\n".join(briefing)
             await send_whatsapp_message_async(recipient_phone=owner_phone, message_text=msg, business_id=business_id)
 
+async def dispatch_customer_appointment_reminders() -> None:
+    """Dispatches 24-hour pre-appointment reminders to customers via WhatsApp."""
+    tomorrow_str = (datetime.datetime.now(SAST_TIMEZONE) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    logger.info(f"Checking for 24h customer appointment reminders for {tomorrow_str}")
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT a.appointment_id, a.business_id, a.subject, a.appointment_date, a.start_time, a.location, c.mobile_number, c.name
+            FROM customer_appointments a
+            JOIN client_table c ON a.customer_id = c.customer_id
+            WHERE a.appointment_date = ? AND a.status IN ('CONFIRMED', 'PENDING_CONFIRMATION') AND a.reminder_sent = 0
+            """,
+            (tomorrow_str,)
+        )
+        reminders = cursor.fetchall()
+        for r in reminders:
+            if not is_feature_enabled(r["business_id"], FEAT_SCHEDULING):
+                continue
+            cust_name = r["name"] or "Customer"
+            msg = f"🔔 *Friendly Reminder:* Hi {cust_name}, you have an appointment tomorrow ({r['appointment_date']} at {r['start_time']}) for '{r['subject']}'. Location: {r['location'] or 'As agreed'}. Reply if you need to reschedule."
+            await send_whatsapp_message_async(recipient_phone=r["mobile_number"], message_text=msg, business_id=r["business_id"])
+            cursor.execute("UPDATE customer_appointments SET reminder_sent = 1 WHERE appointment_id = ?", (r["appointment_id"],))
+        conn.commit()
+
+async def execute_30_day_popia_data_prune() -> None:
+    """
+    Automated 30-Day POPIA Data Retention Worker:
+    1. Purges chat turns and conversation audit logs older than 30 days.
+    2. De-identifies client identity (name, surname, mobile, email) in client_table
+       after 30 days of inactivity while preserving street address and GPS coordinates
+       for Haversine site work lookups.
+    """
+    cutoff_date = (datetime.datetime.now(SAST_TIMEZONE) - datetime.timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(f"Running automated 30-day POPIA retention and data scrub for records prior to {cutoff_date}")
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Purge transient chats & audit logs > 30 days old
+        cursor.execute("DELETE FROM chat_history WHERE created_at < ?", (cutoff_date,))
+        cursor.execute("DELETE FROM conversation_audit_log WHERE created_at < ?", (cutoff_date,))
+
+        # Identify inactive clients > 30 days old with no pending future bookings
+        cursor.execute(
+            """
+            SELECT c.customer_id
+            FROM client_table c
+            WHERE c.created_at < ?
+              AND c.mobile_number NOT LIKE 'ANON_%'
+              AND NOT EXISTS (
+                  SELECT 1 FROM customer_appointments a
+                  WHERE a.customer_id = c.customer_id
+                    AND a.status IN ('CONFIRMED', 'PENDING_CONFIRMATION')
+              )
+            """,
+            (cutoff_date,)
+        )
+        expired_clients = cursor.fetchall()
+
+        for row in expired_clients:
+            cid = row["customer_id"]
+            anon_phone = f"ANON_{uuid.uuid4().hex[:10]}"
+            cursor.execute(
+                """
+                UPDATE client_table
+                SET name = 'De-identified Client',
+                    surname = '',
+                    mobile_number = ?,
+                    email = NULL
+                WHERE customer_id = ?
+                """,
+                (anon_phone, cid)
+            )
+
+        conn.commit()
+
 async def start_background_loop():
-    """Lightweight native asyncio loop for daily digests & hourly reminders."""
+    """Native asyncio loop managing morning digests, hourly reminders, and 00:00 SAST POPIA data purges."""
     while True:
         try:
             now_sast = datetime.datetime.now(SAST_TIMEZONE)
+            # Daily 09:00 SAST Morning Briefing
             if now_sast.hour == 9 and now_sast.minute == 0:
                 await dispatch_daily_morning_digest()
+
+            # Hourly 24-hour appointment reminders
             if now_sast.minute == 0:
                 await dispatch_customer_appointment_reminders()
+
+            # Daily 00:00 SAST POPIA 30-Day Retention Worker
+            if now_sast.hour == 0 and now_sast.minute == 0:
+                await execute_30_day_popia_data_prune()
+
         except Exception as e:
             logger.error(f"Error in background scheduler loop: {e}")
         await asyncio.sleep(60)
 
 ### =====================================================================
-### 10. LIFESPAN, FASTAPI ROUTES & WEBHOOKS
+### 10. LIFESPAN, FASTAPI ROUTES & ADMINISTRATIVE APIs
 ### =====================================================================
+
+def reset_and_init_production_db() -> None:
+    """Deletes existing database files and initializes a fresh, empty schema for production."""
+    for ext in ["", "-wal", "-shm"]:
+        f_path = f"{DB_FILE}{ext}"
+        if os.path.exists(f_path):
+            try:
+                os.remove(f_path)
+                logger.info(f"Purged existing database file: {f_path}")
+            except Exception as e:
+                logger.warning(f"Could not remove {f_path}: {e}")
+
+    init_db()
+    logger.info("Fresh, empty production database schema initialized successfully.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-    seed_test_data()  # <--- AUTOMATIC WIPE & SEED ON STARTUP
-    logger.info("Project Wanda 2 database initialized and seeded with full test data.")
+    reset_and_init_production_db()
+    logger.info("Project Wanda 2 Beta 1 production engine initialized and ready for business onboarding.")
     bg_task = asyncio.create_task(start_background_loop())
     yield
     bg_task.cancel()
 
-app = FastAPI(title="Project Wanda 2 - AI Operations & Billing Engine", lifespan=lifespan)
-
-def verify_meta_signature(raw_payload: bytes, signature_header: Optional[str]) -> bool:
-    """Validates incoming payload against Meta's HMAC-SHA256 signature."""
-    if not signature_header or not APP_SECRET:
-        return False
-    if not signature_header.startswith("sha256="):
-        return False
-
-    expected_hash = signature_header.replace("sha256=", "").strip()
-    computed_hmac = hmac.new(
-        key=APP_SECRET.encode("utf-8"),
-        msg=raw_payload,
-        digestmod=hashlib.sha256,
-    )
-    return hmac.compare_digest(computed_hmac.hexdigest(), expected_hash)
+app = FastAPI(title="Project Wanda 2 Beta 1 - AI Operations & Billing Engine", lifespan=lifespan)
 
 @app.get("/webhook")
 async def verify_webhook(
@@ -1950,7 +2240,7 @@ async def verify_webhook(
 
 @app.post("/webhook")
 async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Receives incoming WhatsApp events, verifies signatures, and delegates to background execution."""
+    """Receives incoming WhatsApp events, verifies HMAC signatures, and delegates to background execution."""
     raw_body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256")
 
@@ -2011,8 +2301,17 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     return {"status": "ok"}
 
 @app.post("/api/webhooks/yoco")
-async def yoco_webhook_handler(request: Request):
-    """Processes Yoco payment notification webhooks (payment.succeeded, payment.failed)."""
+async def yoco_webhook_handler(
+    request: Request,
+    webhook_signature: Optional[str] = Header(None, alias="webhook-signature")
+):
+    """Processes Yoco payment notification webhooks securely using HMAC-SHA256 signature verification."""
+    raw_body = await request.body()
+    
+    if YOCO_WEBHOOK_SECRET and not verify_yoco_signature(raw_body, webhook_signature):
+        log_system_event("CRITICAL", "SECURITY", "Rejected unauthorized Yoco webhook: Invalid HMAC signature")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Yoco webhook signature digest")
+
     try:
         payload = await request.json()
         event_type = payload.get("type")
@@ -2047,8 +2346,8 @@ async def yoco_webhook_handler(request: Request):
         return JSONResponse(content={"status": "error", "message": str(e)}, status_code=400)
 
 @app.post("/api/onboard")
-async def onboard_tenant(payload: Dict[str, Any]):
-    """Self-Service Tenant Onboarding Endpoint."""
+async def onboard_tenant(payload: Dict[str, Any], admin_key: str = Depends(verify_admin_key)):
+    """Self-Service Tenant Onboarding Endpoint protected by Admin API key."""
     business_id = payload.get("business_id") or generate_custom_id("biz")
     business_name = payload.get("business_name")
     man_number = payload.get("owner_phone")
@@ -2061,19 +2360,46 @@ async def onboard_tenant(payload: Dict[str, Any]):
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO business_info (business_id, business_name, primary_mail, primary_e_mail, website, core_business)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(business_id) DO UPDATE SET business_name = excluded.business_name
+            INSERT INTO business_info (
+                business_id, business_name, primary_mail, primary_e_mail,
+                website, core_business, about_business, business_rules,
+                company_reg_number, vat_number, billing_address, billing_email, external_billing_account_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(business_id) DO UPDATE SET
+                business_name = excluded.business_name,
+                primary_e_mail = excluded.primary_e_mail,
+                about_business = COALESCE(excluded.about_business, business_info.about_business),
+                business_rules = COALESCE(excluded.business_rules, business_info.business_rules),
+                company_reg_number = excluded.company_reg_number,
+                vat_number = excluded.vat_number,
+                billing_address = excluded.billing_address,
+                billing_email = excluded.billing_email,
+                external_billing_account_id = excluded.external_billing_account_id
             """,
-            (business_id, business_name, man_number, payload.get("email", ""), payload.get("website", ""), payload.get("core_business", "Services"))
+            (
+                business_id, business_name, man_number,
+                payload.get("email", ""), payload.get("website", ""), payload.get("core_business", "Services"),
+                payload.get("about_business", ""), payload.get("business_rules", ""),
+                payload.get("company_reg_number", ""), payload.get("vat_number", ""),
+                payload.get("billing_address", ""), payload.get("billing_email", payload.get("email", "")),
+                payload.get("external_billing_account_id", "")
+            )
         )
         cursor.execute(
             """
             INSERT INTO business_whatsapp (business_id, w_number, phone_number_id, access_token)
             VALUES (?, ?, ?, ?)
-            ON CONFLICT(w_number) DO UPDATE SET phone_number_id = excluded.phone_number_id, access_token = excluded.access_token
+            ON CONFLICT(w_number) DO UPDATE SET
+                phone_number_id = excluded.phone_number_id,
+                access_token = excluded.access_token
             """,
-            (business_id, normalize_phone(w_number), payload.get("phone_number_id", PHONE_NUMBER_ID), payload.get("access_token", WHATSAPP_TOKEN))
+            (
+                business_id,
+                normalize_phone(w_number),
+                payload.get("phone_number_id", PHONE_NUMBER_ID),
+                encrypt_secret(payload.get("access_token", WHATSAPP_TOKEN))
+            )
         )
         cursor.execute(
             """
@@ -2107,6 +2433,7 @@ async def onboard_tenant(payload: Dict[str, Any]):
             """,
             (business_id,)
         )
+
         if payload.get("yoco_secret_key"):
             cursor.execute(
                 """
@@ -2116,11 +2443,38 @@ async def onboard_tenant(payload: Dict[str, Any]):
                     yoco_secret_key = excluded.yoco_secret_key,
                     yoco_public_key = excluded.yoco_public_key
                 """,
-                (business_id, payload.get("yoco_secret_key"), payload.get("yoco_public_key", ""))
+                (business_id, encrypt_secret(payload.get("yoco_secret_key")), payload.get("yoco_public_key", ""))
             )
         conn.commit()
 
+    for feat_code in [FEAT_FRONT_DESK, FEAT_SCHEDULING, FEAT_INVOICING]:
+        set_tenant_feature_state(business_id, feat_code, True)
+
     return {"status": "success", "business_id": business_id, "message": f"Tenant '{business_name}' successfully onboarded."}
+
+@app.post("/api/admin/tenants/{tenant_id}/features")
+async def update_tenant_features(
+    tenant_id: str,
+    payload: Dict[str, Any],
+    admin_key: str = Depends(verify_admin_key)
+):
+    """Admin route to activate/deactivate components and set custom pricing overrides."""
+    feature_code = payload.get("feature_code")
+    is_active = payload.get("is_active", True)
+    custom_price = payload.get("price_zar")
+
+    if not feature_code or feature_code not in [FEAT_FRONT_DESK, FEAT_SCHEDULING, FEAT_INVOICING]:
+        raise HTTPException(status_code=400, detail="Invalid feature_code")
+
+    set_tenant_feature_state(tenant_id, feature_code, is_active, custom_price)
+
+    return {
+        "status": "success",
+        "tenant_id": tenant_id,
+        "feature_code": feature_code,
+        "is_active": is_active,
+        "custom_price_zar": custom_price
+    }
 
 if __name__ == "__main__":
     import uvicorn
